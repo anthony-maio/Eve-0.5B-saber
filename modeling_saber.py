@@ -866,13 +866,18 @@ class SABERForCausalLM(PreTrainedModel, GenerationMixin):
                 out += (pkv,)
             return out
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=pkv,
             hidden_states=all_hs,
             attentions=all_attn,
         )
+        # Expose component losses for training loop logging
+        if labels is not None:
+            output["ce_loss"] = ce_loss
+            output["curiosity_loss"] = curiosity_loss
+        return output
 
     # ------------------------------------------------------------------ #
     # Generation helpers

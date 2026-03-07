@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Eve-3-SABER-1B: 20B-token 3-stage curriculum pretraining.
-Launch: accelerate launch --config_file accelerate_config.yaml --machine_rank 0 train_full.py
+Launch: bash launch.sh
 """
 
 # ============================================================

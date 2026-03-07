@@ -26,6 +26,8 @@ import wandb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_full")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ---- Hardware detection ----
 def detect_hardware():
@@ -137,22 +139,14 @@ STAGE_3_STEPS = STAGE_3_TOKENS // _actual_batch_tokens
 # Format: (dataset_id, config_or_split, weight, streaming)
 DATA_MIX_STAGE1 = [
     ("HuggingFaceFW/fineweb-edu", "sample-350BT", 0.35, True),
-    ("bigcode/starcoderdata",     "python",        0.20, True),
-    ("bigcode/starcoderdata",     "javascript",    0.08, True),
-    ("bigcode/starcoderdata",     "typescript",    0.04, True),
-    ("bigcode/starcoderdata",     "rust",          0.015, True),
-    ("bigcode/starcoderdata",     "go",            0.015, True),
-    ("mlfoundations/dclm-baseline-1.0", "default", 0.15, True),
+    ("bigcode/starcoderdata",     "default",       0.35, True),
+    ("mlfoundations/dclm-baseline-1.0", None,        0.15, True),
     ("open-web-math/open-web-math", "default",     0.10, True),
     ("HuggingFaceTB/cosmopedia",  "web_samples_v2", 0.05, True),
 ]
 
 DATA_MIX_STAGE2 = [
-    ("bigcode/starcoderdata",     "python",        0.25, True),
-    ("bigcode/starcoderdata",     "javascript",    0.10, True),
-    ("bigcode/starcoderdata",     "typescript",    0.06, True),
-    ("bigcode/starcoderdata",     "rust",          0.02, True),
-    ("bigcode/starcoderdata",     "go",            0.02, True),
+    ("bigcode/starcoderdata",     "default",       0.45, True),
     ("HuggingFaceFW/fineweb-edu", "sample-10BT",   0.15, True),
     ("HuggingFaceTB/finemath",    "finemath-4+",   0.10, True),
     ("HuggingFaceTB/cosmopedia",  "web_samples_v2", 0.10, True),
@@ -165,7 +159,7 @@ DATA_MIX_STAGE3 = [
     ("HuggingFaceFW/finepdfs",    "default",       0.15, True),
     ("HuggingFaceTB/cosmopedia",  "web_samples_v2", 0.15, True),
     ("wikimedia/wikipedia",       "20231101.en",   0.10, True),
-    ("mlfoundations/dclm-baseline-1.0", "default", 0.05, True),
+    ("mlfoundations/dclm-baseline-1.0", None,        0.05, True),
 ]
 
 STAGES = [
@@ -266,7 +260,7 @@ def build_streaming_datasets(data_mix, tag="train"):
     for ds_id, cfg, weight, streaming in data_mix:
         try:
             logger.info(f"Loading {ds_id}/{cfg} (weight={weight/total_weight:.0%})...")
-            ds = load_dataset(ds_id, cfg, split=tag, streaming=streaming, trust_remote_code=True)
+            ds = load_dataset(ds_id, cfg, split=tag, streaming=streaming) if cfg else load_dataset(ds_id, split=tag, streaming=streaming)
             ds = ds.shuffle(seed=SEED, buffer_size=10_000)
             loaded.append((ds, weight / total_weight))
         except Exception as e:

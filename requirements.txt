@@ -1,0 +1,31 @@
+# Eve-3-SABER-1B — Python dependencies
+#
+# Core requirements to load and run the model.
+# Install with:  pip install -r requirements.txt
+#
+# For training / ablation runs, also install the [train] extras below.
+
+# ---- Inference (required) ----
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
+safetensors>=0.4.2
+tokenizers>=0.15.0
+
+# ---- Evaluation utilities (required for eval_utils.py) ----
+matplotlib>=3.7.0
+numpy>=1.24.0
+
+# ---- Optional: nicer anchor heatmaps ----
+seaborn>=0.13.0
+
+# ---- Training / ablation (optional) ----
+# Uncomment for full training / ablation runs:
+# datasets>=2.18.0
+# wandb>=0.17.0
+# tqdm>=4.66.0
+
+# ---- FlashAttention 2 (optional, Ampere GPUs only) ----
+# Requires CUDA 11.8+ and a compatible GPU (A100, H100, RTX 3090/4090, etc.)
+# Install separately due to CUDA version constraints:
+#   pip install flash-attn --no-build-isolation

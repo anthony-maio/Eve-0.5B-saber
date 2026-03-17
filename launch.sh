@@ -1,26 +1,16 @@
 #!/bin/bash
-# Eve-3-SABER-1B Single-Node Training Launch Script
+# Eve-3-SABER-0.5B Training Launch Script
 # Usage: bash launch.sh
+# NOTE: Do NOT install torch on RunPod — it ships with a working CUDA build.
 
 set -euo pipefail
 
-NPROC="${NPROC:-8}"
-
-echo "=== Eve-3-SABER-1B Training ==="
-echo "  GPUs: ${NPROC}"
+echo "=== Eve-3-SABER-0.5B Training ==="
 echo ""
 
-# Install deps if needed
-pip install -q torch transformers accelerate datasets safetensors \
+# Install deps (NO torch — RunPod pre-installs it with correct CUDA)
+pip install -q transformers accelerate datasets safetensors \
     tokenizers wandb numpy tqdm huggingface_hub zstandard 2>/dev/null
-
-# Try to install flash-attn (optional, will fallback to SDPA)
-pip install -q flash-attn --no-build-isolation 2>/dev/null || true
-
-# NCCL tuning
-export NCCL_IB_DISABLE=0
-export NCCL_NET_GDR_LEVEL=5
-export NCCL_DEBUG=WARN
 
 # Login to HuggingFace if token is set
 if [ -n "${HF_TOKEN:-}" ]; then
@@ -32,9 +22,5 @@ if [ -n "${WANDB_API_KEY:-}" ]; then
     wandb login "$WANDB_API_KEY" 2>/dev/null || true
 fi
 
-# Launch training
-torchrun \
-    --nproc_per_node="$NPROC" \
-    --nnodes=1 \
-    --standalone \
-    train_full.py
+# Launch training (single GPU — no torchrun needed)
+python train_full.py

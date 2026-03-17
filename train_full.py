@@ -272,12 +272,17 @@ class PackedDataset(IterableDataset):
         while True:
             idx = rng.choices(range(len(iterators)), weights=weights, k=1)[0]
             try:
-                yield next(iterators[idx])
+                item = next(iterators[idx])
             except StopIteration:
+                # Stream exhausted — restart it (PEP 479: can't let StopIteration escape a generator)
                 iterators[idx] = iter(self.datasets[idx][0])
-                yield next(iterators[idx])
+                try:
+                    item = next(iterators[idx])
+                except StopIteration:
+                    continue
             except Exception:
                 continue
+            yield item
 
     def __iter__(self):
         buffer = []
@@ -599,7 +604,9 @@ if __name__ == '__main__':
     print(f'  Steps this session: {step - start_step:,}')
     print(f'  Tokens this session: {session_tokens/1e9:.2f}B')
     print(f'  Wall time: {elapsed_h:.1f}h')
-    print(f'  Throughput: {session_tokens/elapsed_h/1e9:.2f}B tok/h')
+    tput = session_tokens / max(elapsed_h, 0.001) / 1e9
+    print(f'  Throughput: {tput:.2f}B tok/h')
     print(f'\n  GLOBAL PROGRESS: {tokens_seen/1e9:.1f}B / {TOTAL_TOKENS/1e9:.0f}B ({tokens_seen/TOTAL_TOKENS*100:.1f}%)')
-    print(f'  Estimated remaining: {(TOTAL_TOKENS - tokens_seen) / (session_tokens / max(elapsed_h, 0.01)):.0f}h')
+    if tput > 0:
+        print(f'  Estimated remaining: {(TOTAL_TOKENS - tokens_seen) / 1e9 / tput:.0f}h')
     print(f'{"="*50}')

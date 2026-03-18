@@ -359,29 +359,51 @@ class ThreadedPackedDataset(IterableDataset):
 
     @staticmethod
     def _mixer(source_qs, weights, output_q, stop, seq_len, seed):
-        """Pulls tokens from source queues by weight, packs into fixed-length sequences."""
+        """Pulls tokens from source queues by weight, packs into fixed-length sequences.
+
+        Key design: NEVER block on a possibly-empty queue. Only read from
+        queues that have data ready, weighted-sample among those.
+        """
         rng = random.Random(seed + 999)
         buffer = deque()
         buf_len = 0
         n = len(source_qs)
 
         while not stop.is_set():
-            idx = rng.choices(range(n), weights=weights)[0]
+            # Find which source queues have data ready (non-blocking check)
+            ready = [i for i in range(n) if not source_qs[i].empty()]
+
+            if not ready:
+                # No data available anywhere — short sleep, not a 2s block
+                time.sleep(0.01)
+                continue
+
+            # Weighted sample among READY queues only
+            ready_weights = [weights[i] for i in ready]
+            idx = ready[rng.choices(range(len(ready)), weights=ready_weights)[0]]
+
             try:
-                tokens = source_qs[idx].get(timeout=2)
+                tokens = source_qs[idx].get_nowait()
                 buffer.extend(tokens)
                 buf_len += len(tokens)
             except queue_module.Empty:
-                for j in range(n):
-                    try:
-                        tokens = source_qs[j].get_nowait()
-                        buffer.extend(tokens)
-                        buf_len += len(tokens)
-                        break
-                    except queue_module.Empty:
-                        continue
-                continue
+                continue  # lost race, just retry
 
+            # Drain any other ready queues too (batch to reduce loop overhead)
+            for _ in range(16):
+                ready2 = [i for i in range(n) if not source_qs[i].empty()]
+                if not ready2:
+                    break
+                r_w = [weights[i] for i in ready2]
+                idx2 = ready2[rng.choices(range(len(ready2)), weights=r_w)[0]]
+                try:
+                    tokens = source_qs[idx2].get_nowait()
+                    buffer.extend(tokens)
+                    buf_len += len(tokens)
+                except queue_module.Empty:
+                    break
+
+            # Pack complete sequences — deque.popleft() is O(1)
             while buf_len >= seq_len:
                 chunk = [buffer.popleft() for _ in range(seq_len)]
                 buf_len -= seq_len

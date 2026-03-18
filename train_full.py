@@ -199,6 +199,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 import threading
 import queue as queue_module
+from collections import deque
 
 set_seed(SEED)
 
@@ -360,7 +361,8 @@ class ThreadedPackedDataset(IterableDataset):
     def _mixer(source_qs, weights, output_q, stop, seq_len, seed):
         """Pulls tokens from source queues by weight, packs into fixed-length sequences."""
         rng = random.Random(seed + 999)
-        buffer = []
+        buffer = deque()
+        buf_len = 0
         n = len(source_qs)
 
         while not stop.is_set():
@@ -368,19 +370,21 @@ class ThreadedPackedDataset(IterableDataset):
             try:
                 tokens = source_qs[idx].get(timeout=2)
                 buffer.extend(tokens)
+                buf_len += len(tokens)
             except queue_module.Empty:
                 for j in range(n):
                     try:
                         tokens = source_qs[j].get_nowait()
                         buffer.extend(tokens)
+                        buf_len += len(tokens)
                         break
                     except queue_module.Empty:
                         continue
                 continue
 
-            while len(buffer) >= seq_len:
-                chunk = buffer[:seq_len]
-                buffer = buffer[seq_len:]
+            while buf_len >= seq_len:
+                chunk = [buffer.popleft() for _ in range(seq_len)]
+                buf_len -= seq_len
                 t = torch.tensor(chunk, dtype=torch.long)
                 try:
                     output_q.put(
@@ -400,7 +404,7 @@ def build_stage_dataloader(stage_idx, seed_offset=0):
         data_mix=stage['data_mix'],
         seq_len=SEQ_LEN,
         seed=SEED + seed_offset,
-        buffer_size=10000,
+        buffer_size=512,    # 512 sequences = ~1M tokens prefetch
         fetch_batch=200,
     )
 

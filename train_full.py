@@ -197,15 +197,12 @@ from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+import threading
+import queue as queue_module
 
 set_seed(SEED)
 
 # ---- Data mixes ----
-# Note: bigcode/starcoderdata and codeparrot/github-code-clean both fail
-# (config issues / legacy dataset scripts). Using smollm-corpus python-edu
-# as primary code source -- it's curated, high-quality Python/ML code.
-#
-# Stage 1: Foundation (25B) -- broad language + code
 DATA_MIX_STAGE1 = [
     ('HuggingFaceTB/smollm-corpus',     'python-edu',     0.35, True),
     ('HuggingFaceFW/fineweb-edu',       'sample-350BT',   0.25, True),
@@ -215,7 +212,6 @@ DATA_MIX_STAGE1 = [
     ('HuggingFaceFW/finepdfs',          'eng_Latn',      0.05, True),
 ]
 
-# Stage 2: Specialization (15B) -- heavy code + technical
 DATA_MIX_STAGE2 = [
     ('HuggingFaceTB/smollm-corpus',     'python-edu',     0.50, True),
     ('HuggingFaceTB/finemath',          'finemath-4+',    0.15, True),
@@ -225,7 +221,6 @@ DATA_MIX_STAGE2 = [
     ('HuggingFaceFW/fineweb-edu',       'sample-10BT',    0.05, True),
 ]
 
-# Stage 3: Anneal (10B) -- highest quality, LR -> 0
 DATA_MIX_STAGE3 = [
     ('HuggingFaceTB/smollm-corpus',     'python-edu',     0.35, True),
     ('HuggingFaceTB/finemath',          'finemath-4+',    0.20, True),
@@ -243,103 +238,179 @@ STAGES = [
 ]
 
 
-# ---- Tokenization + packing ----
-def tokenise_example(example):
-    text = (example.get('text') or example.get('content') or
-            example.get('passage') or example.get('document') or '')
-    if not isinstance(text, str) or len(text.strip()) < 50:
-        return None
-    try:
-        ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
-        return ids + [EOS_ID]
-    except Exception:
-        return None
+# ---- Fast threaded data pipeline ----
+# Multi-threaded: one fetcher thread per dataset source for parallel I/O,
+# batch tokenization (Rust backend, GIL-free), large buffer queue.
 
+class ThreadedPackedDataset(IterableDataset):
+    """
+    Multi-threaded streaming with parallel I/O and batch tokenization.
 
-class PackedDataset(IterableDataset):
-    """Streams from weighted HF datasets, packs into fixed-length sequences."""
+    Architecture:
+      [Fetcher 1] --tokens--> [q1] --|
+      [Fetcher 2] --tokens--> [q2] --|--> [Mixer] --packed--> [output_q] --> DataLoader
+      ...                             |
+      [Fetcher N] --tokens--> [qN] --|
+    """
 
-    def __init__(self, hf_datasets_weighted, seq_len=SEQ_LEN, seed=SEED, max_tokens=None):
-        self.datasets = hf_datasets_weighted
+    def __init__(self, data_mix, seq_len, seed, buffer_size=10000, fetch_batch=200):
+        self.data_mix = data_mix
         self.seq_len = seq_len
         self.seed = seed
-        self.max_tokens = max_tokens
-
-    def _interleave_streams(self):
-        rng = random.Random(self.seed)
-        iterators = [iter(ds) for ds, _ in self.datasets]
-        weights = [w for _, w in self.datasets]
-        while True:
-            idx = rng.choices(range(len(iterators)), weights=weights, k=1)[0]
-            try:
-                item = next(iterators[idx])
-            except StopIteration:
-                # Stream exhausted — restart it (PEP 479: can't let StopIteration escape a generator)
-                iterators[idx] = iter(self.datasets[idx][0])
-                try:
-                    item = next(iterators[idx])
-                except StopIteration:
-                    continue
-            except Exception:
-                continue
-            yield item
+        self.buffer_size = buffer_size
+        self.fetch_batch = fetch_batch
 
     def __iter__(self):
-        buffer = []
-        tokens_emitted = 0
-        for example in self._interleave_streams():
-            if self.max_tokens and tokens_emitted >= self.max_tokens:
-                break
-            ids = tokenise_example(example)
-            if ids is None:
-                continue
-            buffer.extend(ids)
-            while len(buffer) >= self.seq_len:
-                chunk = buffer[:self.seq_len]
-                buffer = buffer[self.seq_len:]
-                input_ids = torch.tensor(chunk, dtype=torch.long)
-                yield {'input_ids': input_ids, 'labels': input_ids.clone()}
-                tokens_emitted += self.seq_len
+        output_q = queue_module.Queue(maxsize=self.buffer_size)
+        stop = threading.Event()
+        threads = []
 
+        total_weight = sum(w for _, _, w, _ in self.data_mix)
+        source_qs = []
+        weights = []
 
-def build_streaming_datasets(data_mix):
-    loaded = []
-    total_weight = sum(w for _, _, w, _ in data_mix)
-    for ds_id, cfg, weight, streaming in data_mix:
+        for i, (ds_id, cfg, weight, _) in enumerate(self.data_mix):
+            sq = queue_module.Queue(maxsize=5000)
+            source_qs.append(sq)
+            weights.append(weight / total_weight)
+
+            t = threading.Thread(
+                target=self._fetcher,
+                args=(ds_id, cfg, sq, stop, self.seed + i, self.fetch_batch),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+            logger.info(f'  Started fetcher: {ds_id}/{cfg} ({weights[-1]:.0%})')
+
+        mixer = threading.Thread(
+            target=self._mixer,
+            args=(source_qs, weights, output_q, stop, self.seq_len, self.seed),
+            daemon=True,
+        )
+        mixer.start()
+        threads.append(mixer)
+
         try:
-            logger.info(f'Loading {ds_id}/{cfg} ({weight/total_weight:.0%})...')
+            while True:
+                try:
+                    yield output_q.get(timeout=300)
+                except queue_module.Empty:
+                    alive = sum(1 for t in threads if t.is_alive())
+                    logger.warning(f'Data pipeline: 5min timeout ({alive}/{len(threads)} threads alive)')
+                    if alive <= 1:
+                        break
+        finally:
+            stop.set()
+
+    @staticmethod
+    def _fetcher(ds_id, cfg, out_q, stop, seed, batch_size):
+        """Fetches from one HF streaming dataset, batch-tokenizes, pushes token lists."""
+        try:
             if cfg:
-                ds = load_dataset(ds_id, cfg, split='train', streaming=streaming)
+                ds = load_dataset(ds_id, cfg, split='train', streaming=True)
             else:
-                ds = load_dataset(ds_id, split='train', streaming=streaming)
-            ds = ds.shuffle(seed=SEED, buffer_size=10_000)
-            loaded.append((ds, weight / total_weight))
+                ds = load_dataset(ds_id, split='train', streaming=True)
+            ds = ds.shuffle(seed=seed, buffer_size=10_000)
         except Exception as e:
-            logger.warning(f'Failed to load {ds_id}/{cfg}: {e}')
-    total_w = sum(w for _, w in loaded)
-    loaded = [(ds, w / total_w) for ds, w in loaded]
-    return loaded
+            logger.warning(f'Fetcher failed: {ds_id}/{cfg}: {e}')
+            return
+
+        it = iter(ds)
+
+        while not stop.is_set():
+            batch_texts = []
+            for _ in range(batch_size):
+                if stop.is_set():
+                    return
+                try:
+                    item = next(it)
+                except StopIteration:
+                    it = iter(ds)
+                    try:
+                        item = next(it)
+                    except StopIteration:
+                        break
+                except Exception:
+                    continue
+
+                text = (item.get('text') or item.get('content') or
+                        item.get('passage') or item.get('document') or '')
+                if isinstance(text, str) and len(text.strip()) >= 50:
+                    batch_texts.append(text)
+
+            if not batch_texts:
+                continue
+
+            try:
+                encoded = tokenizer(
+                    batch_texts, add_special_tokens=False,
+                    truncation=False, return_attention_mask=False,
+                )
+                for ids in encoded['input_ids']:
+                    try:
+                        out_q.put(ids + [EOS_ID], timeout=10)
+                    except queue_module.Full:
+                        if stop.is_set():
+                            return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _mixer(source_qs, weights, output_q, stop, seq_len, seed):
+        """Pulls tokens from source queues by weight, packs into fixed-length sequences."""
+        rng = random.Random(seed + 999)
+        buffer = []
+        n = len(source_qs)
+
+        while not stop.is_set():
+            idx = rng.choices(range(n), weights=weights)[0]
+            try:
+                tokens = source_qs[idx].get(timeout=2)
+                buffer.extend(tokens)
+            except queue_module.Empty:
+                for j in range(n):
+                    try:
+                        tokens = source_qs[j].get_nowait()
+                        buffer.extend(tokens)
+                        break
+                    except queue_module.Empty:
+                        continue
+                continue
+
+            while len(buffer) >= seq_len:
+                chunk = buffer[:seq_len]
+                buffer = buffer[seq_len:]
+                t = torch.tensor(chunk, dtype=torch.long)
+                try:
+                    output_q.put(
+                        {'input_ids': t, 'labels': t.clone()},
+                        timeout=10,
+                    )
+                except queue_module.Full:
+                    if stop.is_set():
+                        return
 
 
-def build_stage_dataloader(stage_idx, seed_offset=0, max_tokens=None):
+def build_stage_dataloader(stage_idx, seed_offset=0):
     stage = STAGES[stage_idx]
     logger.info(f'Building dataloader: {stage["name"]} ({stage["tokens"]/1e9:.0f}B tokens)')
-    datasets = build_streaming_datasets(stage['data_mix'])
-    packed = PackedDataset(
-        hf_datasets_weighted=datasets,
+
+    dataset = ThreadedPackedDataset(
+        data_mix=stage['data_mix'],
         seq_len=SEQ_LEN,
         seed=SEED + seed_offset,
-        max_tokens=max_tokens or stage['tokens'],
+        buffer_size=10000,
+        fetch_batch=200,
     )
-    loader_kwargs = {
-        'batch_size': MICRO_BATCH,
-        'num_workers': DATA_LOADER_WORKERS,
-        'pin_memory': torch.cuda.is_available(),
-    }
-    if DATA_LOADER_WORKERS > 0:
-        loader_kwargs['prefetch_factor'] = 4
-        loader_kwargs['persistent_workers'] = True
-    return DataLoader(packed, **loader_kwargs)
+
+    # num_workers=0: threading is internal (no shard count limitations)
+    return DataLoader(
+        dataset,
+        batch_size=MICRO_BATCH,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
 # ---- LR schedule ----

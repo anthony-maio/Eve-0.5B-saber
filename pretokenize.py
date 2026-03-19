@@ -40,10 +40,12 @@ SOURCES = {
     'fineweb-edu': {
         'id': 'HuggingFaceFW/fineweb-edu', 'cfg': 'sample-350BT',
         'need': 9_000_000_000,
+        'stream_only': True,  # 350BT dataset, don't download fully
     },
     'dclm': {
         'id': 'mlfoundations/dclm-baseline-1.0', 'cfg': None,
         'need': 3_000_000_000,
+        'stream_only': True,  # 27K+ shards, don't download fully
     },
     'open-web-math': {
         'id': 'open-web-math/open-web-math', 'cfg': 'default',
@@ -87,6 +89,11 @@ def tokenize_source(name, info, tokenizer):
     eos_id = tokenizer.eos_token_id
     target = info['need']
     ds_id, cfg = info['id'], info['cfg']
+
+    # Stream-only datasets: too large to download fully
+    if info.get('stream_only'):
+        print(f'\n  [{name}] Streaming (dataset too large for full download)')
+        return _tokenize_streaming(name, info, tokenizer)
 
     # ---- Phase 1: Download to disk (parallel parquet download) ----
     print(f'\n  [{name}] Phase 1: Downloading to disk...')
@@ -187,8 +194,19 @@ def tokenize_source(name, info, tokenizer):
     final = get_existing_tokens(out_path)
     print(f'  [{name}] {final/1e9:.1f}B tokens saved ({out_path.stat().st_size/1e9:.1f}GB)')
 
-    # Free memory — drop the downloaded dataset from RAM
+    # Free memory + disk — drop the downloaded dataset
     del ds
+
+    # Clean up HF cache for this dataset to reclaim disk space
+    # (the .bin file is all we need now)
+    import glob
+    for cache_subdir in CACHE_DIR.glob('*'):
+        if cache_subdir.is_dir() and ds_id.replace('/', '___') in cache_subdir.name:
+            import shutil
+            cache_size = sum(f.stat().st_size for f in cache_subdir.rglob('*') if f.is_file())
+            shutil.rmtree(cache_subdir)
+            print(f'  [{name}] Cleaned HF cache: freed {cache_size/1e9:.1f}GB')
+
     return final
 
 

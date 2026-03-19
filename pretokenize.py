@@ -58,6 +58,7 @@ SOURCES = {
     'finepdfs': {
         'id': 'HuggingFaceFW/finepdfs', 'cfg': 'eng_Latn',
         'need': 6_000_000_000,
+        'stream_only': True,  # 579 shards × 4.8GB = ~2.8TB, don't download fully
     },
     'finemath': {
         'id': 'HuggingFaceTB/finemath', 'cfg': 'finemath-4+',
@@ -95,8 +96,15 @@ def tokenize_source(name, info, tokenizer):
         print(f'\n  [{name}] Streaming (dataset too large for full download)')
         return _tokenize_streaming(name, info, tokenizer)
 
+    # ---- Disk space guard: stream if <50GB free ----
+    import shutil as _shutil
+    free_gb = _shutil.disk_usage(CACHE_DIR).free / 1e9
+    if free_gb < 50:
+        print(f'\n  [{name}] Only {free_gb:.0f}GB free, switching to streaming to avoid disk full')
+        return _tokenize_streaming(name, info, tokenizer)
+
     # ---- Phase 1: Download to disk (parallel parquet download) ----
-    print(f'\n  [{name}] Phase 1: Downloading to disk...')
+    print(f'\n  [{name}] Phase 1: Downloading to disk ({free_gb:.0f}GB free)...')
     try:
         if cfg:
             ds = load_dataset(ds_id, cfg, split='train', cache_dir=str(CACHE_DIR))

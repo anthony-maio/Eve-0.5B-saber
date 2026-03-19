@@ -107,14 +107,24 @@ def tokenize_source(name, info, tokenizer):
     # Figure out the text column
     sample = ds[0]
     text_col = None
-    for col in ['text', 'content', 'passage', 'document']:
+    for col in ['text', 'content', 'passage', 'document', 'code', 'body',
+                'input', 'output', 'instruction', 'response', 'markdown']:
         if col in sample and isinstance(sample[col], str):
             text_col = col
             break
 
     if text_col is None:
-        print(f'  [{name}] No text column found in {list(sample.keys())}')
-        return existing
+        # Last resort: find the first string column with substantial content
+        for col in sample:
+            if isinstance(sample[col], str) and len(sample[col]) > 100:
+                text_col = col
+                print(f'  [{name}] Auto-detected text column: "{col}"')
+                break
+
+    if text_col is None:
+        print(f'  [{name}] No text column in {list(sample.keys())}, falling back to streaming...')
+        del ds
+        return _tokenize_streaming(name, info, tokenizer)
 
     # Estimate how many examples we need (avg ~500 tokens/example)
     # Take more than needed since some will be filtered

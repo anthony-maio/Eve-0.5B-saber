@@ -1,53 +1,58 @@
-# Eve-3-SABER-1B: Three Novel Mechanisms for Making Small Models Weird in Useful Ways
+# Eve-3-0.5B-SABER: Three Novel Mechanisms for Making Small Models Weird in Useful Ways
 
 **Anthony Maio — Making Minds AI**
 *March 2026*
 
-> **SABER** — **S**emantic **A**nchor-**B**iased **E**xperience-**R**esonant. The third model in the Eve series, following Eve-2-MoE-272M. A 1B dense transformer with three novel mechanisms that test specific hypotheses about attention biasing, cross-layer memory, and FFN modulation.
+> **SABER** — **S**emantic **A**nchor-**B**iased **E**xperience-**R**esonant. The third model in the Eve series, following Eve-2-MoE-272M. A 500M dense transformer with three novel mechanisms that test specific hypotheses about attention biasing, cross-layer memory, and FFN modulation.
 
 ---
 
-## Opening: Why Build Another 1B Model?
+## Opening: Why Build a 500M Research Model?
 
-There are a lot of 1B parameter language models out there right now. Most of them are essentially LLaMA-small: dense decoder-only transformers with SwiGLU, RoPE, RMSNorm, no biases, and nothing architecturally surprising. They're good. They're well-understood. They're boring.
+There are a lot of sub-1B parameter language models out there right now. Most of them are essentially LLaMA-small: dense decoder-only transformers with SwiGLU, RoPE, RMSNorm, no biases, and nothing architecturally surprising. They're good. They're well-understood. They're boring.
 
-I don't mean that as an insult. Boring is powerful — boring means the optimizer knows what to do, FlashAttention works out of the box, and you can reason about training dynamics because a thousand people have already walked that path. But I kept wondering: what if you took that exact envelope — the same 1B parameter budget, the same hardware constraints, the same training recipes — and made it *architecturally novel* instead of just scaling a known design down?
+I don't mean that as an insult. Boring is powerful — boring means the optimizer knows what to do, FlashAttention works out of the box, and you can reason about training dynamics because a thousand people have already walked that path. But I kept wondering: what if you took that exact envelope — the same parameter budget, the same hardware constraints, the same training recipes — and made it *architecturally novel* instead of just scaling a known design down?
 
 Not novel for novelty's sake. Novel in ways that test specific hypotheses about what transformers could be doing internally if we gave them slightly different machinery.
 
-That's Eve-3-SABER-1B. It started from a single question I kept coming back to in the Eve project: *"What if we made a 1B dense model that's actually weird in a useful way?"* I refined the architecture through an iterative design process — prototyping, pressure-testing each decision against alternatives, and deliberately arguing both sides of every trade-off before committing. I'll walk through the reasoning behind the key choices.
+That's Eve-3-SABER. It started at 1B parameters, but budget constraints pushed it down to 500M — which turned out to be a blessing. At 500M, the model trains faster, ablations run cheaper, and the architectural hypotheses get stress-tested harder. If novel components help at 500M, they'll likely help more at scale, not less. And we're over-training at 100× Chinchilla-optimal (50B tokens for 500M params), which means the architecture has to actually *earn* its keep — there's nowhere to hide behind insufficient data.
 
-Eve-3-SABER-1B introduces three novel architectural components on top of a standard transformer skeleton:
+Eve-3-SABER introduces three novel architectural components on top of a standard transformer skeleton:
 
 1. **Slip-Anchors** — learned attention biases injected through K/V modification, preserving FlashAttention compatibility
-2. **Experience Stream** — a per-token, cross-layer state vector with a curiosity-driven auxiliary loss
+2. **Experience Stream** — a per-token, cross-layer state vector with decay gating, LayerNorm stabilization, and a curiosity-driven auxiliary loss
 3. **Resonant FFN** — sinusoidal modulation of feed-forward outputs with self-regulating learned blending
 
 None of these require custom CUDA kernels. All of them are designed so that if they don't help, the model can learn to ignore them. And all of them connect to ideas I've been developing in the broader Eve project and slipstream work — semantic anchors, biomimetic curiosity, manifold resonance.
-
-I don't know if this will work. That's the point.
 
 ---
 
 ## 1. The Standard Skeleton
 
-Before we get to the weird stuff, let's establish what's conventional. Eve-3-SABER-1B is built on a foundation that would look familiar to anyone who's read the LLaMA or Mistral papers:
+Before we get to the weird stuff, let's establish what's conventional. Eve-3-0.5B-SABER is built on a foundation that would look familiar to anyone who's read the LLaMA or Mistral papers:
 
 | Parameter | Value |
 |-----------|-------|
-| `d_model` | 2048 |
-| `n_layers` | 24 |
-| `n_heads` | 16 |
+| `d_model` | 1536 |
+| `n_layers` | 20 |
+| `n_heads` | 12 |
 | `head_dim` | 128 |
-| `d_ff` | 2855 |
+| `d_ff` | 2164 |
 | `vocab_size` | 50257 |
 | `max_seq_len` | 2048 |
+| **Total params** | **499,976,458** |
 
-The FFN uses SwiGLU with three matrices (W1, W3, W2). The `d_ff` was tuned via a param counter script to 2855, which — once you account for the novel components consuming ~73M params — lands the total at exactly 1,000,001,548 parameters. The original ⅔-scaling estimate of 5461 overcounted because it didn't account for the slip-anchor, experience stream, and resonant FFN overhead. Positional information comes from RoPE with θ=10000. Normalization is RMSNorm in the pre-norm position. No biases anywhere in the main projections. The LM head shares weights with the token embedding layer.
+The FFN uses SwiGLU with three matrices (W1, W3, W2). The `d_ff` was tuned via a param counter script to 2164, which — once you account for the novel components consuming ~34.5M params — lands the total at ~500M parameters. Positional information comes from RoPE with θ=10000. Normalization is RMSNorm in the pre-norm position. No biases anywhere in the main projections. The LM head shares weights with the token embedding layer.
 
-Why these choices? Because they're *proven* at 1B scale. I didn't want to confound novel mechanisms with non-standard baselines. If I'm testing three new ideas, the last thing I need is to also wonder whether my normalization scheme is causing problems. The skeleton is intentionally vanilla so the novel components can be evaluated cleanly.
+Why these choices? Because they're *proven* at this scale. I didn't want to confound novel mechanisms with non-standard baselines. If I'm testing three new ideas, the last thing I need is to also wonder whether my normalization scheme is causing problems. The skeleton is intentionally vanilla so the novel components can be evaluated cleanly.
 
-The standard components — embeddings (~103M), QKV projections (~302M), output projections (~101M), SwiGLU FFNs (~421M at d_ff=2855), and norms (~0.1M) — account for the vast majority of the ~1.0B parameter budget. The three novel components together add only ~73.4M parameters (~7.3% of the total). They're lightweight modifications, not heavy new machinery.
+The standard components account for ~93% of the parameter budget. The three novel components together add only ~34.5M parameters (~6.9% of the total). They're lightweight modifications, not heavy new machinery.
+
+### Scale Decision: 1B → 0.5B
+
+The original design was 1B parameters (d_model=2048, n_layers=24, d_ff=2855, ~73M novel params). Budget constraints forced a downsizing. Rather than compromising on training tokens, I chose to halve the model and keep the 50B token target — resulting in roughly 100× Chinchilla-optimal training. This is actually a more rigorous test of the architecture: if the novel components provide useful inductive biases, over-training will make that signal clearer, not weaker.
+
+The proportional structure was preserved: novel components remain ~7% of total parameters, the head dimension stays at 128 for hardware alignment, and all three mechanisms operate at every layer (or every other layer for Resonant FFN) just as in the 1B design.
 
 ---
 
@@ -69,26 +74,23 @@ This is the core architectural trick, and it's why the name includes "slip" — 
 
 ### The Mechanism in Detail
 
-Each attention layer maintains a learnable **codebook** of 64 anchors, each living in a d_anchor=128 dimensional space. Think of these as prototypical "attention situations" — learned archetypes that the model can blend between.
+Each attention layer maintains a learnable **codebook** of 64 anchors, each living in a d_anchor=96 dimensional space. Think of these as prototypical "attention situations" — learned archetypes that the model can blend between.
 
 Here's how it works step by step:
 
 ```python
 # 1. Project hidden state into anchor space
-h_anchor = h @ W_anchor_down          # (B, L, d_model) -> (B, L, d_anchor)
-                                        # W_anchor_down: (2048, 128)
+h_anchor = h @ W_anchor_down          # (B, L, 1536) -> (B, L, 96)
 
 # 2. Score against the codebook
-scores = softmax(h_anchor @ anchors.T)  # (B, L, d_anchor) @ (d_anchor, n_anchors)
-                                        # -> (B, L, 64)
+scores = softmax(h_anchor @ anchors.T)  # (B, L, 96) @ (96, 64) -> (B, L, 64)
 
 # 3. Compute weighted anchor context
-anchor_ctx = scores @ anchors           # (B, L, 64) @ (64, d_anchor)
-                                        # -> (B, L, 128)
+anchor_ctx = scores @ anchors           # (B, L, 64) @ (64, 96) -> (B, L, 96)
 
 # 4. Project to K and V bias
-k_bias = anchor_ctx @ U_k              # (B, L, d_anchor) -> (B, L, head_dim)
-v_bias = anchor_ctx @ U_v              # (B, L, d_anchor) -> (B, L, head_dim)
+k_bias = anchor_ctx @ U_k              # (B, L, 96) -> (B, L, 128)
+v_bias = anchor_ctx @ U_v              # (B, L, 96) -> (B, L, 128)
 
 # 5. Apply RoPE to Q and K first, THEN add anchor bias to K
 Q, K = apply_rope(Q, K)
@@ -120,22 +122,18 @@ A critical design consideration is *when* to apply anchor biases relative to RoP
 
 This way, the anchor bias operates in post-RoPE space. The bias is purely content-dependent, and positional encoding remains clean.
 
-### Connection to the Broader Work
-
-The "anchor" concept didn't come from nowhere. In the Eve project's slipstream architecture, semantic anchors are a recurring motif — the idea that meaning can be grounded by soft lookup against a learned codebook of archetypes. Slip-anchors are the attention-specific instantiation of that idea: what if attention could be grounded against a small set of learned "situations"?
-
 ### Parameter Cost
 
-The slip-anchor machinery is remarkably cheap:
+The slip-anchor machinery is remarkably cheap at 0.5B scale:
 
-- `W_anchor_down`: 2048 × 128 = 262K
-- `anchors`: 64 × 128 = 8K
-- `U_k`: 128 × 128 = 16K
-- `U_v`: 128 × 128 = 16K
-- **Per layer: ~0.3M**
-- **Total across 24 layers: ~7.2M** (less than 1% of total parameters)
+- `W_anchor_down`: 1536 × 96 = 147K
+- `anchors`: 64 × 96 = 6K
+- `U_k`: 96 × 128 = 12K
+- `U_v`: 96 × 128 = 12K
+- **Per layer: ~178K**
+- **Total across 20 layers: ~3.6M** (less than 1% of total parameters)
 
-That's the beauty of the bottleneck design. The d_anchor=128 space is small enough that the entire mechanism is almost free in terms of parameters, and the computation is dominated by the `h @ W_anchor_down` matmul, which is trivially fast relative to the attention operation it modifies.
+That's the beauty of the bottleneck design. The d_anchor=96 space is small enough that the entire mechanism is almost free in terms of parameters, and the computation is dominated by the `h @ W_anchor_down` matmul, which is trivially fast relative to the attention operation it modifies.
 
 ---
 
@@ -147,48 +145,65 @@ Here's something that's always struck me as odd about transformers: each layer p
 
 What if there was?
 
-The experience stream is a low-dimensional per-token vector (d_exp=256) that flows layer-to-layer. It's a dedicated channel for cross-layer communication that exists *outside* the residual stream. Each layer reads the current experience state, updates it, and optionally uses it.
+The experience stream is a low-dimensional per-token vector (d_exp=192) that flows layer-to-layer. It's a dedicated channel for cross-layer communication that exists *outside* the residual stream. Each layer reads the current experience state, updates it, and optionally uses it.
 
 ### How It Works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Layer i                           │
-│                                                     │
-│  Input: h (residual stream), exp_state (d_exp=256)  │
-│                                                     │
-│  1. h_post_attn = attention(h)                      │
-│                                                     │
-│  2. s = W_s @ h_post_attn     (d_model -> d_exp)    │
-│     [summary of what this layer "saw"]              │
-│                                                     │
-│  3. s_sg = s.detach()          [stop gradient!]     │
-│                                                     │
-│  4. s_pred = W_pred @ exp_state (d_exp -> d_exp)    │
-│     [predict what we'd see based on prior layers]   │
-│                                                     │
-│  5. curiosity = ||s_sg - s_pred||²                  │
-│     [prediction error = surprise signal]            │
-│                                                     │
-│  6. exp_state = exp_state + silu(W_e @ s)           │
-│     [update experience with gated summary]          │
-│                                                     │
-│  Output: h (unchanged), exp_state (updated)         │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                     Layer i                           │
+│                                                      │
+│  Input: h (residual stream), exp_state (d_exp=192)   │
+│                                                      │
+│  1. h_post_attn = attention(h)                       │
+│                                                      │
+│  2. s = W_s @ h_post_attn      (d_model -> d_exp)   │
+│     [summary of what this layer "saw"]               │
+│                                                      │
+│  3. s_sg = s.detach()           [stop gradient!]     │
+│                                                      │
+│  4. s_pred = W_pred @ exp_state  (d_exp -> d_exp)    │
+│     [predict what we'd see based on prior layers]    │
+│                                                      │
+│  5. curiosity = ||s_sg - s_pred||²                   │
+│     [prediction error = surprise signal]             │
+│                                                      │
+│  6. decay = sigmoid(decay_raw)   [element-wise gate] │
+│     delta = silu(W_e @ s)                            │
+│     exp_state = decay * exp_state + delta            │
+│     exp_state = LayerNorm(exp_state)                 │
+│                                                      │
+│  Output: h (unchanged), exp_state (updated)          │
+└──────────────────────────────────────────────────────┘
 ```
 
 In code:
 
 ```python
 # Per layer
-s = h_post_attn @ W_s                    # (B, L, 2048) -> (B, L, 256)
-s_sg = s.detach()                         # CRITICAL: stop gradient
+s = h_post_attn @ W_s                        # (B, L, 1536) -> (B, L, 192)
+s_sg = s.detach()                             # CRITICAL: stop gradient
 
-s_pred = experience_state @ W_pred        # (B, L, 256) -> (B, L, 256)
-curiosity = ((s_sg - s_pred) ** 2).mean() # scalar prediction error
+s_pred = experience_state @ W_pred            # (B, L, 192) -> (B, L, 192)
+curiosity = ((s_sg - s_pred) ** 2).mean()     # scalar prediction error
 
-experience_state = experience_state + silu(s @ W_e)  # gated update
+decay = torch.sigmoid(self.decay_raw)         # element-wise, init ~0.95
+delta = F.silu(self.W_e(s))
+experience_state = decay * experience_state + delta
+experience_state = self.exp_norm(experience_state)  # LayerNorm stabilization
 ```
+
+### Decay Gate and LayerNorm: Stabilization Fixes
+
+The original 1B design used a simpler additive update: `exp_state = exp_state + silu(W_e @ s)`. In practice, this led to the experience state growing unboundedly through 20+ layers, which destabilized training.
+
+Two fixes were applied:
+
+1. **Decay gate**: Each layer has a learnable per-dimension decay vector, initialized at `sigmoid(3.0) ≈ 0.95`. This means the experience state naturally decays — information from early layers fades unless actively maintained. The gate is element-wise, so different dimensions can have different time constants.
+
+2. **LayerNorm**: Applied after each state update to keep the experience state in a well-conditioned range. This prevents the accumulation of scale drift across 20 layers and keeps gradients flowing cleanly.
+
+Together, these make the experience stream much more stable during training without changing its fundamental character.
 
 ### Why This Is NOT an RNN
 
@@ -201,13 +216,13 @@ This means:
 - **Initialization**: `exp_state` is zeros at the start of each sequence. No hidden state carries over between sequences.
 - **Parallelism**: the entire forward pass is fully parallelizable over the sequence length, just like a standard transformer.
 - **Recomputability**: during gradient checkpointing, you can recompute any layer's experience state from the activations — no need to cache it.
-- **Inference**: the KV cache is all you need. No extra state to manage. The experience stream adds zero inference complexity because it's recomputed from scratch on every forward pass anyway.
+- **Inference**: the KV cache is all you need. No extra state to manage.
 
 It's a vertical skip connection with learned dynamics, not recurrence.
 
 ### The Curiosity Mechanism
 
-The curiosity signal is the most speculative part of Eve-3-SABER-1B, and it connects directly to ideas from the broader Eve project about biomimetic AI.
+The curiosity signal is the most speculative part of Eve-3-SABER, and it connects directly to ideas from the broader Eve project about biomimetic AI.
 
 Each layer predicts what the *next* layer will see, based on accumulated experience. When that prediction is wrong — when a layer encounters something the prior layers didn't prepare it for — that's a "curiosity" signal. The prediction error is collected as an auxiliary loss:
 
@@ -225,19 +240,15 @@ If you don't stop the gradient on `s` when computing curiosity, you create a per
 
 With stop-grad, the curiosity loss can only train `W_pred` to be a better predictor. It can't reach back and simplify what the layers are actually computing. The experience stream stays honest.
 
-### Connection to the Eve Project
-
-The experience stream is the most directly "Eve-inspired" component in Eve-3-SABER-1B. In the Eve project's design documents, there's a concept I call *mnemos* — a kind of running experiential memory that accumulates across processing stages. The experience stream is a minimal, tractable version of that idea: what's the simplest mechanism that lets layers build a shared narrative about what's happening in the sequence?
-
-The curiosity mechanism, specifically, connects to the project's interest in biomimetic AI. Biological neural systems are fundamentally driven by prediction error — the brain is a prediction machine, and surprise is the signal that drives learning and attention allocation. The experience stream's curiosity loss is a tiny echo of that principle: layers that encounter something unexpected generate a signal, and the model is gently encouraged to maintain that capacity for surprise.
-
 ### Parameter Cost
 
-- `W_s`: 2048 × 256 = 524K
-- `W_pred`: 256 × 256 = 65.5K
-- `W_e`: 256 × 256 = 65.5K
-- **Per layer: ~0.66M**
-- **Total across 24 layers: ~15.8M** (~1.6% of total parameters)
+- `W_s`: 1536 × 192 = 295K
+- `W_pred`: 192 × 192 = 37K
+- `W_e`: 192 × 192 = 37K
+- `decay_raw`: 192 (negligible)
+- `exp_norm`: 192 (negligible)
+- **Per layer: ~369K**
+- **Total across 20 layers: ~7.4M** (~1.5% of total parameters)
 
 ---
 
@@ -251,10 +262,10 @@ The question: what if FFN layers could learn to modulate their outputs with peri
 
 ### The Architecture
 
-Eve-3-SABER-1B alternates between two types of FFN:
+Eve-3-SABER alternates between two types of FFN:
 
-- **Even layers (0, 2, 4, ..., 22)**: Resonant FFN
-- **Odd layers (1, 3, 5, ..., 23)**: Standard SwiGLU FFN
+- **Even layers (0, 2, 4, ..., 18)**: Resonant FFN (10 layers)
+- **Odd layers (1, 3, 5, ..., 19)**: Standard SwiGLU FFN (10 layers)
 
 The alternating pattern is deliberate. Half the layers are conventional, providing a stable backbone. The other half have the option — but not the obligation — to use sinusoidal modulation.
 
@@ -265,7 +276,7 @@ Here's the resonant FFN:
 ffn_out = W2(silu(W1(x)) * W3(x))         # (B, L, d_model)
 
 # Sinusoidal modulation
-freq_proj = x @ W_freq                     # (B, L, d_model) -> (B, L, d_model)
+freq_proj = x @ W_freq                     # (B, L, 1536) -> (B, L, 1536)
 mod = torch.sin(freq_proj)                 # periodic response
 
 # Self-regulating blend
@@ -298,34 +309,12 @@ Over training, the optimizer can push `alpha_raw` in either direction:
 
 This is what I mean by "self-regularizing." If sinusoidal modulation doesn't help for a particular layer, the path of least resistance is to keep alpha high and effectively disable it. The mechanism doesn't fight the optimizer. It gets out of the way.
 
-### The Sinusoidal Modulation
-
-`W_freq` is a full (d_model × d_model) matrix that projects the input into a "frequency space." The sin() function then creates periodic response patterns. The key insight is that different dimensions of the frequency projection can learn different frequencies, phases, and input sensitivities. So the modulation isn't a single sine wave — it's a d_model-dimensional vector where each component is a different sinusoidal function of the input.
-
-Multiplying `ffn_out * (1 + mod)` means the modulation is *multiplicative*: it gates or amplifies different dimensions of the FFN output based on the sinusoidal response. Dimensions where `sin(freq_proj)` is near zero pass through unchanged. Dimensions where it's near ±1 get significantly boosted or suppressed.
-
-### How Layers Self-Select
-
-One of the most interesting things I hope to observe during training is the pattern of alpha values across layers. My predictions:
-
-- **Early layers** (0, 2, 4) will likely keep alpha high — they're doing basic feature extraction where periodicity isn't obviously useful
-- **Middle layers** (10, 12, 14) might open up resonance — this is where more abstract pattern matching happens
-- **Late layers** (20, 22) could go either way — they're close to the output, where resonance might help with certain token predictions (numbers? code syntax?) or might just add noise
-
-But honestly, I have no idea. That's why we're running the ablation.
-
-### Connection to Manifold Resonance
-
-In the Eve project's theoretical framework, there's an idea I call manifold resonance: the hypothesis that learned representations in deep networks naturally organize along low-dimensional manifolds, and that periodic structures in these manifolds carry meaningful information. Resonant FFNs are a direct test of a weak version of this hypothesis — if sinusoidal modulation of FFN outputs provides a useful inductive bias, it suggests the representations have periodic structure that the model can exploit.
-
-This is speculative. I want to be honest about that. Manifold resonance is a theoretical idea, not an established result. Eve-3-SABER-1B's resonant FFN is one of the first concrete implementations designed to test whether the intuition has any empirical basis.
-
 ### Parameter Cost
 
-- `W_freq`: 2048 × 2048 = 4,194K
+- `W_freq`: 1536 × 1536 = 2,359K
 - `alpha_raw`: 1 (negligible)
-- **Per resonant layer: ~4.2M additional**
-- **Across 12 even layers: ~50.4M** (~5% of total parameters)
+- **Per resonant layer: ~2.4M additional**
+- **Across 10 even layers: ~23.6M** (~4.7% of total parameters)
 
 The W_freq matrix is the single most expensive novel component in the entire architecture. It's a full d_model × d_model matrix, which is substantial. But it only appears on half the layers, and the alpha mechanism ensures that if it's not earning its keep, the model can functionally disable it.
 
@@ -333,84 +322,114 @@ The W_freq matrix is the single most expensive novel component in the entire arc
 
 ## 5. Design Trade-offs and Key Decisions
 
-Every novel architecture involves trade-offs. Here are the ones I wrestled with most during Eve-3-SABER-1B's design, and the reasoning behind my choices.
-
 ### Non-Negotiable Constraints
 
 Some decisions weren't really decisions at all — they were constraints I set early and refused to compromise on:
 
-- **FlashAttention compatibility is non-negotiable.** Any attention modification that requires custom kernels is a dealbreaker at 1B scale. This is why slip-anchors modify K/V rather than the attention matrix.
-- **Stop-gradient on `s` in the curiosity mechanism.** Without it, representational collapse is almost guaranteed. This was clear from first principles and confirmed in early prototyping.
-- **The self-regulating alpha in Resonant FFN.** Without a way for the model to disable resonance per-layer, you're forcing an inductive bias that might not help. Alpha gives the optimizer an escape hatch.
-- **SwiGLU with ⅔ scaling as the baseline FFN.** This is the right choice for 1B scale in 2026. No need to innovate on the backbone.
-- **The ablation plan is essential.** With three novel components, you need to measure each one's contribution independently. Otherwise you're just guessing.
+- **FlashAttention compatibility is non-negotiable.** Any attention modification that requires custom kernels is a dealbreaker. This is why slip-anchors modify K/V rather than the attention matrix.
+- **Stop-gradient on `s` in the curiosity mechanism.** Without it, representational collapse is almost guaranteed.
+- **The self-regulating alpha in Resonant FFN.** Without a way for the model to disable resonance per-layer, you're forcing an inductive bias that might not help.
+- **SwiGLU with ⅔ scaling as the baseline FFN.** The right choice for this scale in 2026.
+- **The ablation plan is essential.** With three novel components, you need to measure each one's contribution independently.
 
 ### Depth vs. Width
 
-I considered two configurations: 20 layers with a wider model, or 24 layers with a narrower one (d_ff tuned accordingly). I went with 24. The reasoning: depth gives the experience stream more layers to accumulate information, and the slip-anchors more opportunities to specialize per layer. Width helps raw capacity, but the novel components benefit more from depth.
-
-### Anchor Scoring Input
-
-This is covered in detail in the slip-anchors section above. The short version: scoring from Q is more attention-relevant, but scoring from `h` avoids circularity and is cheaper. I chose `h` for theoretical cleanliness. It's a clean ablation to test the alternative later.
-
-### Activation Function for Experience Stream Update
-
-I debated between GELU and SiLU for the gated experience update. SiLU won for consistency — it matches the SwiGLU activation used throughout the model, which means the optimizer sees similar nonlinearity landscapes across components. One less variable to worry about.
+I considered two configurations: 16 layers with a wider model, or 20 layers with a narrower one. I went with 20. The reasoning: depth gives the experience stream more layers to accumulate information, and the slip-anchors more opportunities to specialize per layer. Width helps raw capacity, but the novel components benefit more from depth.
 
 ### Parameter Budget Allocation
 
-Early designs used d_ff=5461 (the standard ⅔ scaling of 8192), which would have put the model at ~1.38B params. I chose to shrink d_ff to 2855 to hit exactly 1B, absorbing the ~73M cost of the novel components. The alternative — a 1.07B model with standard d_ff — would have made ablation comparisons messier, since the baseline and full model would have different parameter counts. Matching the budget exactly means any improvement comes from architecture, not size.
+The 0.5B budget was tuned so that novel components consume ~6.9% of total parameters — close to the 7.3% ratio of the original 1B design. This means results should transfer directionally between scales. The d_ff was tuned to 2164 to absorb the ~34.5M cost of the novel components while hitting the 500M target.
+
+### Novel Component Summary
+
+| Component | Per Layer | Layers | Total | % of Model |
+|-----------|----------|--------|-------|------------|
+| Slip-Anchors | 178K | 20 | 3.6M | 0.7% |
+| Experience Stream | 369K | 20 | 7.4M | 1.5% |
+| Resonant FFN | 2,359K | 10 | 23.6M | 4.7% |
+| **Total novel** | | | **34.5M** | **6.9%** |
 
 ---
 
 ## 6. Training Strategy
 
-### Data
+### Data: 3-Stage Curriculum
 
-The training data mix is:
+Eve-3-SABER is trained on 50B tokens using a 3-stage curriculum designed to build broad foundations first, then specialize:
+
+**Stage 1: Foundation (25B tokens)** — broad language + code
 
 | Source | Proportion | Purpose |
 |--------|-----------|---------|
-| FineWeb-Edu | 55% | High-quality educational and general text |
-| DCLM | 35% | Diverse, curated web text |
-| Code + Math | 10% | Structured reasoning, formal language |
+| SmolLM python-edu | 35% | High-quality Python/ML code |
+| FineWeb-Edu | 25% | Curated educational web text |
+| Open-Web-Math | 15% | Mathematical reasoning |
+| DCLM | 10% | Diverse curated web text |
+| Cosmopedia | 10% | Synthetic educational content |
+| FinePDFs | 5% | Academic/technical PDFs |
 
-This is a standard mix for a 1B model in 2026. Nothing exotic here — I want training data to be a controlled variable, not a confound.
+**Stage 2: Specialization (15B tokens)** — heavy code + technical
 
-### Two-Stage Training
+| Source | Proportion |
+|--------|-----------|
+| SmolLM python-edu | 50% |
+| FineMath | 15% |
+| FinePDFs | 15% |
+| Open-Web-Math | 10% |
+| Cosmopedia | 5% |
+| FineWeb-Edu | 5% |
 
-The training plan uses a two-stage approach:
+**Stage 3: Anneal (10B tokens)** — highest quality, LR → 0
 
-**Stage 1: Main training** on ~90B tokens with cosine learning rate schedule, linear warmup over 2000 steps, peak learning rate of 3e-4.
+| Source | Proportion |
+|--------|-----------|
+| SmolLM python-edu | 35% |
+| FineMath | 20% |
+| Cosmopedia | 15% |
+| Wikipedia | 10% |
+| FinePDFs | 10% |
+| FineWeb-Edu | 5% |
+| Open-Web-Math | 5% |
 
-**Stage 2: Annealing** over the final ~10B tokens. Learning rate decays to near-zero. This is where the model "locks in" its learned representations and the alpha values in resonant FFN layers stabilize.
+The curriculum is designed for the model's target use case: **code and tool use**, not general-purpose chat. Python-edu is the dominant source throughout, ensuring the model develops strong code understanding. The stage transitions shift toward increasingly specialized and high-quality sources.
 
-Target is 100B tokens total — roughly 5× Chinchilla optimal for a 1B model. We're intentionally over-training because the novel components might need extra data to find their groove.
+### Learning Rate Schedule
+
+- **Stages 1-2**: Cosine schedule, peak 3e-4, minimum 3e-5, warmup over 2000 steps
+- **Stage 3**: Linear decay from 3e-5 to 0 (annealing)
 
 ### Compute
 
-- **Primary training**: RunPod H100 PCIe instances. Not the fastest cards, but cost-effective for a research run.
-- **Ablation runs**: Local RTX 3090s. The 5-run ablation plan (baseline, +anchors, +experience, +resonant, full) at reduced scale to validate each component before committing to the full 100B token run.
-- **Mixed precision**: bf16 throughout, with FlashAttention 2 for SDPA.
+- **Primary training**: NVIDIA B200 (178 GB VRAM) on RunPod. Single GPU, bf16 mixed precision.
+- **Ablation study**: Ran on H200 SXM (140 GB). Five configurations: baseline, +anchors, +experience, +resonant, full.
+- **Batch size**: ~524K tokens per optimizer step (micro_batch=16, grad_accum=16, seq_len=2048).
 - **Optimizer**: AdamW with betas=(0.9, 0.95), weight_decay=0.1, gradient clipping at 1.0.
-- **Batch size**: ~0.5M tokens per step (micro-batches × gradient accumulation × sequence length).
+- **Checkpointing**: Every 500 steps, with stage-boundary checkpoints preserved.
+- **Data pipeline**: Pre-tokenized binary files read via numpy mmap, eliminating network I/O bottlenecks.
 
-### Predictability Mode
+### Over-Training Rationale
 
-One of the more practical design ideas that came out of iterating on the architecture is the "predictability mode" configuration. The idea: ship the model with a conservative default that disables most novel components, then let researchers gradually enable them.
+50B tokens for a 500M parameter model is roughly 100× Chinchilla-optimal. This is deliberate:
 
-```python
-# Predictability mode config
-gate_bias = -3          # Anchor scores biased toward uniform -> nearly off
-U_e_scale = 0.05        # Experience stream updates are tiny
-resonant_layers = "last_8"  # Only layers 16-22 use resonant FFN
-```
-
-This gives you a model that behaves almost like a standard transformer out of the box, but can be "opened up" by adjusting three numbers. It's insurance against the novel components being harmful — you can always fall back to something conventional.
+1. **Architecture stress test**: With abundant data, any performance difference between the full model and ablated baselines is more likely architectural, not data-limited.
+2. **Code-focused**: Code and tool-use tasks benefit from extended training more than general language, since the distribution is narrower and the model needs to memorize patterns and APIs.
+3. **Practical**: The model is intended for deployment, not as a scaling law data point. Over-training produces better models for a given inference cost.
 
 ---
 
-## 7. What I Hope To Learn
+## 7. Post-Training Pipeline
+
+After pretraining, Eve-3-SABER goes through a two-phase supervised fine-tuning pipeline:
+
+**SFT Phase 1**: General instruction following using alpaca-cleaned + code instructions. This teaches the model to follow instructions and format outputs.
+
+**SFT Phase 2**: Function calling and tool use using specialized datasets (glaive function calling, xlam, hermes). This is the core capability target — a small model that can reliably parse function schemas, generate tool calls, and process tool outputs.
+
+An optional DPO/ORPO phase may follow for tool-use quality refinement.
+
+---
+
+## 8. What I Hope To Learn
 
 This is an experiment. I want to be clear about what I'm trying to learn, not what I'm trying to prove.
 
@@ -424,27 +443,21 @@ After training, I can inspect which anchors fire for which inputs. If anchor 17 
 
 ### Do alpha values converge to interesting patterns?
 
-Across the 12 resonant FFN layers, do the learned alpha values show a gradient? Do early layers suppress resonance while later layers embrace it? Or do all layers converge to alpha ≈ 1.0, meaning the model learned to ignore resonance entirely? This is one of the cleanest readouts of whether the resonant FFN hypothesis has any merit.
+Across the 10 resonant FFN layers, do the learned alpha values show a gradient? Do early layers suppress resonance while later layers embrace it? Or do all layers converge to alpha ≈ 1.0, meaning the model learned to ignore resonance entirely? This is one of the cleanest readouts of whether the resonant FFN hypothesis has any merit.
 
 ### Can this approach scale?
 
-If the novel components help at 1B, do they help more or less at 3B? 7B? The parameter overhead is small enough that scaling is feasible. But inductive biases that help at small scale sometimes become irrelevant at large scale — the model just learns around them. I'd love to know where on that curve slip-anchors and experience streams sit.
-
-### Connections to Eve
-
-Eve-3-SABER-1B is a stepping stone in the Eve project. Eve's long-term goal is to build AI systems that incorporate biomimetic principles — experience, curiosity, resonance — into their architecture, not just their training objectives. SABER is the first test of whether these ideas survive contact with actual gradient descent on actual data.
+If the novel components help at 500M, do they help more or less at 1B? 3B? The parameter overhead is small enough that scaling is feasible. But inductive biases that help at small scale sometimes become irrelevant at large scale — the model just learns around them. I'd love to know where on that curve slip-anchors and experience streams sit.
 
 ---
 
 ## Closing
 
-Eve-3-SABER-1B is an experiment, not a claim of superiority. I'm not arguing that it will beat LLaMA-1B on benchmarks (though I'll measure and report). I'm arguing that the architectural design space for small transformers is much larger than what's currently being explored, and that there are testable hypotheses worth testing.
+Eve-3-0.5B-SABER is an experiment, not a claim of superiority. I'm not arguing that it will beat other 500M models on benchmarks (though I'll measure and report). I'm arguing that the architectural design space for small transformers is much larger than what's currently being explored, and that there are testable hypotheses worth testing.
 
 The three novel components — slip-anchors, experience stream, resonant FFN — are each designed to be independently evaluable, independently disableable, and compatible with standard training and inference infrastructure. If all three fail, the model degrades gracefully to a standard transformer. If any of them succeed, we learn something about what transformers can do with slightly different machinery.
 
-Everything will be open-source: model weights, training code, training logs, ablation results. The goal is to expand what's possible, not to gatekeep what's proven.
-
-If you're interested in this work, want to collaborate, or want to tell me why slip-anchors will never work — I'd love to hear from you.
+Everything is open-source: model weights, training code, training logs, ablation results. The goal is to expand what's possible, not to gatekeep what's proven.
 
 **Anthony Maio**
 anthony@making-minds.ai

@@ -418,19 +418,145 @@ class ThreadedPackedDataset(IterableDataset):
                         return
 
 
+# ---- Mmap dataset for pre-tokenized .bin files ----
+# Map dataset IDs to .bin file names
+TOKEN_DIR = RUN_DIR / 'tokens'
+DS_TO_BIN = {
+    ('HuggingFaceTB/smollm-corpus', 'python-edu'): 'python-edu',
+    ('HuggingFaceFW/fineweb-edu', 'sample-350BT'): 'fineweb-edu',
+    ('HuggingFaceFW/fineweb-edu', 'sample-10BT'): 'fineweb-edu',
+    ('mlfoundations/dclm-baseline-1.0', None): 'dclm',
+    ('open-web-math/open-web-math', 'default'): 'open-web-math',
+    ('HuggingFaceTB/cosmopedia', 'web_samples_v2'): 'cosmopedia',
+    ('HuggingFaceFW/finepdfs', 'eng_Latn'): 'finepdfs',
+    ('HuggingFaceTB/finemath', 'finemath-4+'): 'finemath',
+    ('wikimedia/wikipedia', '20231101.en'): 'wikipedia',
+}
+
+
+class MmapPackedDataset(torch.utils.data.Dataset):
+    """Map-style dataset reading pre-tokenized .bin files via numpy mmap.
+    Zero network I/O — reads directly from NVMe via OS page cache.
+    Full DataLoader worker parallelism (no shard limitations).
+    """
+
+    def __init__(self, source_files_weights, seq_len, seed, total_seqs):
+        self.seq_len = seq_len
+        self.total_seqs = total_seqs
+        self.seed = seed
+        self.sources = []
+        self.cum_weights = []
+
+        cum = 0.0
+        total_w = sum(w for _, w in source_files_weights)
+        for path, weight in source_files_weights:
+            mm = np.memmap(path, dtype=np.uint16, mode='r')
+            n_chunks = len(mm) // seq_len
+            if n_chunks == 0:
+                continue
+            self.sources.append((mm, n_chunks))
+            cum += weight / total_w
+            self.cum_weights.append(cum)
+
+        self._rng = None
+
+    def _get_rng(self):
+        if self._rng is None:
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+            self._rng = random.Random(self.seed + worker_id)
+        return self._rng
+
+    def __len__(self):
+        return self.total_seqs
+
+    def __getitem__(self, idx):
+        rng = self._get_rng()
+
+        # Weighted source selection
+        r = rng.random()
+        src_idx = len(self.sources) - 1
+        for i, cw in enumerate(self.cum_weights):
+            if r < cw:
+                src_idx = i
+                break
+
+        mm, n_chunks = self.sources[src_idx]
+        chunk_idx = rng.randrange(n_chunks)
+        start = chunk_idx * self.seq_len
+
+        tokens = torch.from_numpy(
+            mm[start:start + self.seq_len].astype(np.int64).copy()
+        )
+        return {'input_ids': tokens, 'labels': tokens.clone()}
+
+
+def _check_bin_files(data_mix):
+    """Check which .bin files exist for a stage's data mix. Returns list of (path, weight) or None."""
+    if not TOKEN_DIR.exists():
+        return None
+
+    found = []
+    total_weight = sum(w for _, _, w, _ in data_mix)
+    missing = []
+
+    for ds_id, cfg, weight, _ in data_mix:
+        bin_name = DS_TO_BIN.get((ds_id, cfg))
+        if bin_name is None:
+            missing.append(f'{ds_id}/{cfg}')
+            continue
+        bin_path = TOKEN_DIR / f'{bin_name}.bin'
+        if bin_path.exists() and bin_path.stat().st_size > 0:
+            found.append((bin_path, weight / total_weight))
+        else:
+            missing.append(bin_name)
+
+    if missing:
+        logger.info(f'  Missing .bin files: {missing} — falling back to streaming')
+        return None
+
+    return found
+
+
 def build_stage_dataloader(stage_idx, seed_offset=0):
     stage = STAGES[stage_idx]
     logger.info(f'Building dataloader: {stage["name"]} ({stage["tokens"]/1e9:.0f}B tokens)')
 
+    # Try mmap from pre-tokenized .bin files first
+    bin_files = _check_bin_files(stage['data_mix'])
+    if bin_files:
+        logger.info(f'  Using pre-tokenized .bin files from {TOKEN_DIR}')
+        for path, w in bin_files:
+            n_tok = path.stat().st_size // 2
+            logger.info(f'    {path.name}: {n_tok/1e9:.1f}B tokens, weight={w:.2f}')
+
+        total_seqs = stage['tokens'] // SEQ_LEN
+        dataset = MmapPackedDataset(
+            source_files_weights=bin_files,
+            seq_len=SEQ_LEN,
+            seed=SEED + seed_offset,
+            total_seqs=total_seqs,
+        )
+
+        return DataLoader(
+            dataset,
+            batch_size=MICRO_BATCH,
+            num_workers=DATA_LOADER_WORKERS,
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=4 if DATA_LOADER_WORKERS > 0 else None,
+            persistent_workers=DATA_LOADER_WORKERS > 0,
+        )
+
+    # Fallback: threaded streaming
+    logger.info(f'  Using threaded streaming (no .bin files found)')
     dataset = ThreadedPackedDataset(
         data_mix=stage['data_mix'],
         seq_len=SEQ_LEN,
         seed=SEED + seed_offset,
-        buffer_size=512,    # 512 sequences = ~1M tokens prefetch
+        buffer_size=512,
         fetch_batch=200,
     )
 
-    # num_workers=0: threading is internal (no shard count limitations)
     return DataLoader(
         dataset,
         batch_size=MICRO_BATCH,

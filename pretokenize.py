@@ -34,7 +34,7 @@ NUM_PROC = max(1, (os.cpu_count() or 4) - 2)  # leave 2 cores for training
 # Max tokens needed per source across ALL 3 stages (with 10% buffer)
 SOURCES = {
     'python-edu': {
-        'id': 'eminorhan/python-edu', 'cfg': None,
+        'id': 'eminorhan/python-edu', 'cfg': 'all',
         'need': 22_000_000_000,
     },
     'fineweb-edu': {

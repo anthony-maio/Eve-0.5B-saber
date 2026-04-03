@@ -20,6 +20,9 @@ Environment variables:
     EVE_KEEP_LAST_N        Checkpoints to keep (default: 3)
     EVE_LOG_EVERY          Steps between log prints (default: 25)
     EVE_DATA_LOADER_WORKERS  DataLoader workers (default: auto)
+    EVE_HF_UPLOAD_EVERY    Steps between HuggingFace uploads (default: 2500, 0=disabled)
+    EVE_HF_REPO            HuggingFace repo for uploads (default: anthonym21/eve-3-0.5b-saber)
+    EVE_MODEL_CARD          Path to model card template (default: MODEL_CARD_HF.md in repo)
 """
 
 # ============================================================
@@ -173,6 +176,8 @@ SEED = 42
 CHECKPOINT_EVERY = int(os.environ.get('EVE_CHECKPOINT_EVERY', 500))
 KEEP_LAST_N = int(os.environ.get('EVE_KEEP_LAST_N', 3))
 LOG_EVERY = int(os.environ.get('EVE_LOG_EVERY', 25))
+HF_UPLOAD_EVERY = int(os.environ.get('EVE_HF_UPLOAD_EVERY', 2500))
+HF_REPO = os.environ.get('EVE_HF_REPO', 'anthonym21/eve-3-0.5b-saber')
 
 # ---- 3-Stage Curriculum (50B tokens) ----
 STAGE_1_TOKENS = 25_000_000_000
@@ -187,6 +192,8 @@ print(f'\nBatch: micro={MICRO_BATCH}, grad_accum={GRAD_ACCUM}, effective={ACTUAL
 print(f'Total: {TOTAL_STEPS:,} steps | Session: {SESSION_STEPS:,} steps ({SESSION_TOKENS/1e9:.0f}B tokens)')
 print(f'Stages: Foundation={STAGE_1_STEPS:,} | Specialization={STAGE_2_STEPS:,} | Anneal={STAGE_3_STEPS:,}')
 print(f'Checkpoint every {CHECKPOINT_EVERY} steps to {CKPT_DIR}')
+if HF_UPLOAD_EVERY > 0:
+    print(f'HF upload every {HF_UPLOAD_EVERY} steps to {HF_REPO}')
 print(f'Gradient checkpointing: {use_gradient_checkpointing} | DataLoader workers: {DATA_LOADER_WORKERS}')
 
 
@@ -639,6 +646,96 @@ def load_checkpoint(model, optimizer=None):
     return meta
 
 
+# ---- HuggingFace upload ----
+_last_hf_upload_step = 0
+
+def upload_to_hf(model, step, tokens_seen, stage_idx):
+    """Save model + model card to HF. Runs in a background thread to avoid blocking training."""
+    global _last_hf_upload_step
+    if HF_UPLOAD_EVERY <= 0:
+        return
+    _last_hf_upload_step = step
+
+    import threading
+
+    def _upload():
+        try:
+            from huggingface_hub import HfApi
+            export_dir = RUN_DIR / 'hf-upload'
+            if export_dir.exists():
+                shutil.rmtree(export_dir)
+            export_dir.mkdir(parents=True)
+
+            # Save model
+            model.save_pretrained(export_dir)
+            tokenizer.save_pretrained(export_dir)
+            config.save_pretrained(export_dir)
+
+            # Copy trust_remote_code files
+            script_dir = Path(__file__).resolve().parent
+            for fname in ['configuration_saber.py', 'modeling_saber.py']:
+                src = script_dir / fname
+                if src.exists():
+                    shutil.copy(src, export_dir / fname)
+
+            # Build model card with training progress
+            stage_names = {0: 'Foundation', 1: 'Specialization', 2: 'Anneal'}
+            tokens_b = tokens_seen / 1e9
+            pct = tokens_seen / TOTAL_TOKENS * 100
+
+            # Read template model card if available
+            card_path = script_dir / 'MODEL_CARD_HF.md'
+            if card_path.exists():
+                card_text = card_path.read_text(encoding='utf-8')
+                # Update the training progress line if present, or inject after frontmatter
+                progress_block = (
+                    f'\n> **Training Progress:** {tokens_b:.1f}B / {TOTAL_TOKENS/1e9:.0f}B tokens '
+                    f'({pct:.1f}%) | Stage: {stage_names.get(stage_idx, "?")} | Step: {step:,}\n'
+                )
+                # Replace existing progress line or insert after first ---
+                import re
+                if re.search(r'> \*\*Training Progress:\*\*', card_text):
+                    card_text = re.sub(
+                        r'> \*\*Training Progress:\*\*[^\n]*\n',
+                        progress_block.lstrip('\n'),
+                        card_text,
+                    )
+                else:
+                    # Insert after closing frontmatter ---
+                    parts = card_text.split('---', 2)
+                    if len(parts) >= 3:
+                        card_text = parts[0] + '---' + parts[1] + '---' + progress_block + parts[2]
+            else:
+                card_text = (
+                    f'---\nlicense: apache-2.0\ntags: [saber, pretrained, custom-architecture]\n---\n'
+                    f'# Eve-3-SABER-0.5B\n\n'
+                    f'500M param decoder-only LM with three novel architectural components.\n\n'
+                    f'**Training Progress:** {tokens_b:.1f}B / {TOTAL_TOKENS/1e9:.0f}B tokens '
+                    f'({pct:.1f}%) | Stage: {stage_names.get(stage_idx, "?")} | Step: {step:,}\n\n'
+                    f'```python\n'
+                    f'from transformers import AutoModelForCausalLM, AutoTokenizer\n'
+                    f'model = AutoModelForCausalLM.from_pretrained("anthonym21/eve-3-0.5b-saber", trust_remote_code=True)\n'
+                    f'tokenizer = AutoTokenizer.from_pretrained("anthonym21/eve-3-0.5b-saber")\n'
+                    f'```\n'
+                )
+
+            with open(export_dir / 'README.md', 'w', encoding='utf-8') as f:
+                f.write(card_text)
+
+            api = HfApi()
+            api.create_repo(HF_REPO, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(export_dir), repo_id=HF_REPO,
+                commit_message=f'Step {step:,}, {tokens_b:.1f}B tokens ({stage_names.get(stage_idx, "?")})',
+            )
+            logger.info(f'[Step {step:,}] Uploaded to HF: {HF_REPO} ({tokens_b:.1f}B tokens)')
+        except Exception as e:
+            logger.warning(f'[Step {step:,}] HF upload failed: {e}')
+
+    t = threading.Thread(target=_upload, daemon=True)
+    t.start()
+
+
 print('Data pipeline + utilities ready')
 
 
@@ -782,6 +879,10 @@ if __name__ == '__main__':
                         save_checkpoint(raw_model, optimizer, step, tokens_seen,
                                         current_stage_idx, wandb_run_id)
 
+                    if HF_UPLOAD_EVERY > 0 and step % HF_UPLOAD_EVERY == 0:
+                        raw_model = accelerator.unwrap_model(model)
+                        upload_to_hf(raw_model, step, tokens_seen, current_stage_idx)
+
                     pbar.update(1)
 
                     new_stage = get_current_stage(step)
@@ -793,6 +894,7 @@ if __name__ == '__main__':
                         raw_model = accelerator.unwrap_model(model)
                         save_checkpoint(raw_model, optimizer, step, tokens_seen,
                                         new_stage, wandb_run_id)
+                        upload_to_hf(raw_model, step, tokens_seen, new_stage)
 
                         current_stage_idx = new_stage
                         pbar.set_description(STAGES[current_stage_idx]['name'])
@@ -810,11 +912,12 @@ if __name__ == '__main__':
         logger.error(f'\nError: {e}. Saving emergency checkpoint...')
         import traceback; traceback.print_exc()
 
-    # ---- End-of-session save ----
+    # ---- End-of-session save + HF upload ----
     pbar.close()
     raw_model = accelerator.unwrap_model(model)
     save_checkpoint(raw_model, optimizer, step, tokens_seen,
                     current_stage_idx, wandb_run_id)
+    upload_to_hf(raw_model, step, tokens_seen, current_stage_idx)
 
     elapsed_h = (time.time() - session_start) / 3600
     session_tokens = (step - start_step) * ACTUAL_BATCH_TOKENS
